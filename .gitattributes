@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+run-client text eol=lf
+run-server text eol=lf

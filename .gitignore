@@ -1,0 +1,9 @@
+*.ova
+*.vdi
+*.vmdk
+*.iso
+*.pcap
+*.pcapng
+*.log
+__pycache__/
+*.pyc
