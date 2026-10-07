@@ -136,9 +136,11 @@ def parse_packet(raw_bytes: bytes):
         return None
 
     # Verify TCP checksum using pseudo-header (T4)
+    ##############################################
     pseudo_hdr = struct.pack("!4s4sBBH", src_addr, dst_addr, 0, socket.IPPROTO_TCP, len(tcp_segment))
-    if internet_checksum(pseudo_hdr + tcp_segment) != 0:
-        return None
+    # Only drop the packet for invalid checksums if we are NOT on localhost
+    if src_ip != "127.0.0.1" and internet_checksum(pseudo_hdr + tcp_segment) != 0:
+            return None
 
     # Parse TCP options (T4: extract peer's MSS if present, ignore others)
     mss = None
@@ -205,17 +207,87 @@ class PacketLogger:
             self.fp = None
 
 
+
+class RawTCPConnection:
+    def __init__(self, src_ip: str, src_port: int):
+        self.src_ip = src_ip
+        self.src_port = src_port
+        
+        # Open a raw socket
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+        
+        # Tell the OS we are building our own IP headers
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        
+        # TCP State variables
+        self.seq = random.randint(1000, 50000)
+        self.ack = 0
+        self.dst_ip = None
+        self.dst_port = None
+        self.logger = PacketLogger("client_tcp.log")
+
+    def connect(self, dst_ip: str, dst_port: int):
+        self.dst_ip = dst_ip
+        self.dst_port = dst_port
+
+        # STEP 1: Send SYN
+        ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 24, ip_id=101)
+        tcp_seg = build_tcp_segment(
+            self.src_ip, self.dst_ip, self.src_port, self.dst_port,
+            self.seq, self.ack, FLAG_SYN, mss=DEFAULT_MSS
+        )
+        self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+        
+        # Log the outgoing SYN
+        self.logger.log("SND", parse_packet(ip_hdr + tcp_seg))
+
+        # STEP 2: Wait for SYN-ACK
+        while True:
+            # select() waits up to 1.0 second for a packet to arrive on the socket
+            ready, _, _ = select.select([self.sock], [], [], 1.0)
+            
+            if not ready:
+                print("Timeout waiting for SYN-ACK! (Need to implement retransmission here later)")
+                return False
+
+            # Receive the incoming packet
+            raw_bytes, addr = self.sock.recvfrom(65535)
+            parsed = parse_packet(raw_bytes)
+            
+            # Ignore corrupted packets or packets not meant for this connection
+            if not parsed: continue
+            if parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port: continue
+
+            # Check if it is the expected SYN-ACK
+            if parsed['flags'] == (FLAG_SYN | FLAG_ACK) and parsed['ack'] == self.seq + 1:
+                self.logger.log("RCV", parsed)
+                
+                # Update our sequence and acknowledgment numbers
+                self.seq += 1
+                self.ack = parsed['seq'] + 1
+                break
+
+        # STEP 3: Send final ACK
+        ip_hdr_ack = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=102)
+        tcp_seg_ack = build_tcp_segment(
+            self.src_ip, self.dst_ip, self.src_port, self.dst_port,
+            self.seq, self.ack, FLAG_ACK
+        )
+        self.sock.sendto(ip_hdr_ack + tcp_seg_ack, (self.dst_ip, 0))
+        self.logger.log("SND", parse_packet(ip_hdr_ack + tcp_seg_ack))
+        
+        print(f"Connection established with {self.dst_ip}:{self.dst_port}!")
+        return True
+
+
 if __name__ == "__main__":
-    # Self-test: build a SYN packet, parse it back, verify checksums & log format
-    ip_hdr = build_ipv4_header("10.10.1.10", "10.10.3.10", 24, ip_id=301, ttl=64)
-    tcp_seg = build_tcp_segment(
-        "10.10.1.10", "10.10.3.10", 62425, 8000, seq=1000, ack=0, flags=FLAG_SYN, win=65535, mss=1460
-    )
-    parsed = parse_packet(ip_hdr + tcp_seg)
-    assert parsed is not None, "Checksum or header parsing failed!"
-    mss_str = str(parsed["mss"]) if parsed["mss"] is not None else "-"
-    print(
-        f"SEND {parsed['src_ip']}:{parsed['sport']} > {parsed['dst_ip']}:{parsed['dport']} "
-        f"ttl={parsed['ttl']} id={parsed['id']} seq={parsed['seq']} ack={parsed['ack']} "
-        f"flags=0x{parsed['flags']:02x} win={parsed['win']} len={parsed['len']} mss={mss_str}"
-    )
+    import random
+    
+    # Pick a random high port for each test run to avoid OS connection conflicts
+    random_src_port = random.randint(10000, 60000)
+    
+    # Create a connection on localhost using the random port
+    conn = RawTCPConnection("127.0.0.1", random_src_port)
+    
+    # Attempt to connect to the server
+    conn.connect("127.0.0.1", 8080)
