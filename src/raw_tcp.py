@@ -230,44 +230,35 @@ class RawTCPConnection:
         self.dst_ip = dst_ip
         self.dst_port = dst_port
 
-        # STEP 1: Send SYN
         ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 24, ip_id=101)
         tcp_seg = build_tcp_segment(
             self.src_ip, self.dst_ip, self.src_port, self.dst_port,
             self.seq, self.ack, FLAG_SYN, mss=DEFAULT_MSS
         )
-        self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
-        
-        # Log the outgoing SYN
-        self.logger.log("SND", parse_packet(ip_hdr + tcp_seg))
 
-        # STEP 2: Wait for SYN-ACK
+        # Retransmission Loop: Send SYN and wait 1.0s for SYN-ACK
         while True:
-            # select() waits up to 1.0 second for a packet to arrive on the socket
-            ready, _, _ = select.select([self.sock], [], [], 1.0)
-            
-            if not ready:
-                print("Timeout waiting for SYN-ACK! (Need to implement retransmission here later)")
-                return False
+            self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+            self.logger.log("SND", parse_packet(ip_hdr + tcp_seg))
 
-            # Receive the incoming packet
-            raw_bytes, addr = self.sock.recvfrom(65535)
+            ready, _, _ = select.select([self.sock], [], [], 1.0)
+            if not ready:
+                print("Timeout waiting for SYN-ACK, retransmitting SYN...")
+                continue
+
+            raw_bytes, _ = self.sock.recvfrom(65535)
             parsed = parse_packet(raw_bytes)
             
-            # Ignore corrupted packets or packets not meant for this connection
-            if not parsed: continue
-            if parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port: continue
+            if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
+                continue
 
-            # Check if it is the expected SYN-ACK
             if parsed['flags'] == (FLAG_SYN | FLAG_ACK) and parsed['ack'] == self.seq + 1:
                 self.logger.log("RCV", parsed)
-                
-                # Update our sequence and acknowledgment numbers
                 self.seq += 1
                 self.ack = parsed['seq'] + 1
                 break
 
-        # STEP 3: Send final ACK
+        # Send final ACK
         ip_hdr_ack = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=102)
         tcp_seg_ack = build_tcp_segment(
             self.src_ip, self.dst_ip, self.src_port, self.dst_port,
@@ -279,15 +270,133 @@ class RawTCPConnection:
         print(f"Connection established with {self.dst_ip}:{self.dst_port}!")
         return True
 
+    def send_all(self, data: bytes):
+        offset = 0
+        while offset < len(data):
+            # Slice data into MSS-sized chunks
+            chunk = data[offset:offset + DEFAULT_MSS]
+            ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20 + len(chunk), ip_id=103)
+            tcp_seg = build_tcp_segment(
+                self.src_ip, self.dst_ip, self.src_port, self.dst_port,
+                self.seq, self.ack, FLAG_ACK | FLAG_PSH, payload=chunk
+            )
+            
+            packet = ip_hdr + tcp_seg
+            
+            # Retransmission Loop: Send data chunk and wait 1.0s for ACK
+            while True:
+                self.sock.sendto(packet, (self.dst_ip, 0))
+                self.logger.log("SND", parse_packet(packet))
+                
+                ready, _, _ = select.select([self.sock], [], [], 1.0)
+                if not ready:
+                    print(f"Timeout waiting for ACK for seq {self.seq}, retransmitting data...")
+                    continue
+                
+                raw_bytes, _ = self.sock.recvfrom(65535)
+                parsed = parse_packet(raw_bytes)
+                
+                if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
+                    continue
+                
+                # Check for valid ACK
+                if parsed['flags'] & FLAG_ACK:
+                    self.logger.log("RCV", parsed)
+                    # Cumulative ACK check: if the peer acknowledges data beyond our current sequence
+                    if parsed['ack'] > self.seq:
+                        bytes_acked = parsed['ack'] - self.seq
+                        self.seq += bytes_acked
+                        offset += bytes_acked
+                        break
+
+    def recv_all(self) -> bytes:
+        received_data = b""
+        
+        # Loop until the connection is closed or data stops arriving
+        while True:
+            ready, _, _ = select.select([self.sock], [], [], 2.0)
+            if not ready:
+                break # Timeout assuming the server has finished sending data
+                
+            raw_bytes, _ = self.sock.recvfrom(65535)
+            parsed = parse_packet(raw_bytes)
+            
+            if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
+                continue
+                
+            self.logger.log("RCV", parsed)
+            
+            # Process in-order payload
+            if parsed['len'] > 0:
+                if parsed['seq'] == self.ack:
+                    received_data += parsed['payload']
+                    self.ack += parsed['len']
+                    
+                # Acknowledge the received data
+                ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=104)
+                tcp_seg = build_tcp_segment(
+                    self.src_ip, self.dst_ip, self.src_port, self.dst_port,
+                    self.seq, self.ack, FLAG_ACK
+                )
+                self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+                self.logger.log("SND", parse_packet(ip_hdr + tcp_seg))
+                
+            # Handle Server FIN (Teardown)
+            if parsed['flags'] & FLAG_FIN:
+                self.ack += 1
+                ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=105)
+                tcp_seg = build_tcp_segment(
+                    self.src_ip, self.dst_ip, self.src_port, self.dst_port,
+                    self.seq, self.ack, FLAG_ACK
+                )
+                self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+                self.logger.log("SND", parse_packet(ip_hdr + tcp_seg))
+                break
+                
+        return received_data
+
+    def close(self):
+        ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=106)
+        tcp_seg = build_tcp_segment(
+            self.src_ip, self.dst_ip, self.src_port, self.dst_port,
+            self.seq, self.ack, FLAG_FIN | FLAG_ACK
+        )
+        
+        while True:
+            self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+            self.logger.log("SND", parse_packet(ip_hdr + tcp_seg))
+            
+            ready, _, _ = select.select([self.sock], [], [], 1.0)
+            if not ready:
+                continue # Retransmit FIN
+                
+            raw_bytes, _ = self.sock.recvfrom(65535)
+            parsed = parse_packet(raw_bytes)
+            
+            if not parsed or parsed['src_ip'] != self.dst_ip: 
+                continue
+            
+            if parsed['flags'] & FLAG_ACK:
+                self.logger.log("RCV", parsed)
+                break
+        
+        self.sock.close()
+
 
 if __name__ == "__main__":
     import random
     
-    # Pick a random high port for each test run to avoid OS connection conflicts
     random_src_port = random.randint(10000, 60000)
-    
-    # Create a connection on localhost using the random port
     conn = RawTCPConnection("127.0.0.1", random_src_port)
     
-    # Attempt to connect to the server
-    conn.connect("127.0.0.1", 8080)
+    if conn.connect("127.0.0.1", 8080):
+        # Send an HTTP GET request
+        http_request = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        conn.send_all(http_request)
+        
+        # Receive the HTML response
+        response = conn.recv_all()
+        print("\n--- Server Response ---")
+        print(response.decode('utf-8', errors='ignore'))
+        
+        conn.close()
