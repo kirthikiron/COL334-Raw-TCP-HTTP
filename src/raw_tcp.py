@@ -226,6 +226,7 @@ class RawTCPConnection:
         self.logger = PacketLogger(log_path)
         self.early_data = b""  # Buffer for piggybacked data during handshake
         self.peer_closed = False
+        self.out_of_order_buffer = {}  # {seq_number: payload_bytes}
 
     def connect(self):
         ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 24, ip_id=101)
@@ -355,7 +356,17 @@ class RawTCPConnection:
             
             if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
                 continue
-                
+
+            #######################################
+            # --- TEMPORARY LOCAL TESTING BLOCK ---
+            # Drop 10% of data packets artificially
+            # import random
+            # if parsed['len'] > 0 and random.random() < 0.10:
+            #     print(f"[SIMULATED DROP] Ignoring seq {parsed['seq']} to force OOO buffer!")
+            #     continue
+            # -------------------------------------
+            #######################################
+
             self.logger.log("RECV", parsed)
             
             # Drop connection immediately on RST
@@ -363,11 +374,28 @@ class RawTCPConnection:
                 self.peer_closed = True
                 break
             
-            if parsed['len'] > 0 and parsed['seq'] == self.ack:
-                received_data += parsed['payload']
-                self.ack += parsed['len']
-                last_data_time = time.time()
+            # Process Data with OOO Buffering
+            dup_ack_needed = False
+            if parsed['len'] > 0:
+                if parsed['seq'] == self.ack:
+                    received_data += parsed['payload']
+                    self.ack += parsed['len']
+                    last_data_time = time.time()
                     
+                    while self.ack in self.out_of_order_buffer:
+                        buffered_chunk = self.out_of_order_buffer.pop(self.ack)
+                        received_data += buffered_chunk
+                        self.ack += len(buffered_chunk)
+                
+                elif parsed['seq'] > self.ack:
+                    if parsed['seq'] not in self.out_of_order_buffer:
+                        self.out_of_order_buffer[parsed['seq']] = parsed['payload']
+                    dup_ack_needed = True
+                    
+                elif parsed['seq'] < self.ack:
+                    dup_ack_needed = True
+                    
+                # Always ACK in-order data, or send a Dup-ACK for out-of-order/duplicate data
                 ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=104)
                 tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
                 self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
@@ -491,32 +519,50 @@ class RawTCPConnection:
             self.logger.log("RECV", parsed)
 
             payload = b""
-            # 1. Process Data First
-            if parsed['len'] > 0 and parsed['seq'] == self.ack:
-                payload = parsed['payload']
-                self.ack += parsed['len']
+            dup_ack_needed = False
             
-            # 2. Process FIN (FIN occupies 1 sequence number after the payload)
+            # Process Data
+            if parsed['len'] > 0:
+                if parsed['seq'] == self.ack:
+                    # In-order packet received
+                    payload = parsed['payload']
+                    self.ack += parsed['len']
+                    
+                    # Drain the OOO buffer if it has the next expected sequences
+                    while self.ack in self.out_of_order_buffer:
+                        buffered_chunk = self.out_of_order_buffer.pop(self.ack)
+                        payload += buffered_chunk
+                        self.ack += len(buffered_chunk)
+                        
+                elif parsed['seq'] > self.ack:
+                    # Out-of-order packet received: buffer it and trigger a Dup-ACK
+                    if parsed['seq'] not in self.out_of_order_buffer:
+                        self.out_of_order_buffer[parsed['seq']] = parsed['payload']
+                    dup_ack_needed = True
+                    
+                elif parsed['seq'] < self.ack:
+                    # Old duplicate packet received: trigger a Dup-ACK
+                    dup_ack_needed = True
+            
+            # Process FIN (FIN occupies 1 sequence number after the payload)
             fin_processed = False
             if (parsed['flags'] & FLAG_FIN) and (parsed['seq'] + parsed['len'] == self.ack):
                 self.ack += 1
                 self.peer_closed = True
                 fin_processed = True
                 
-            # 3. Send one ACK if we consumed data or a FIN
-            if payload or fin_processed:
+            # Send one ACK if we consumed data, processed a FIN, or need a Dup-ACK
+            if payload or fin_processed or dup_ack_needed:
                 ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=998)
                 tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
                 self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
                 self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
                 
-                # If there was data, return it first. Next call to recv_some will return b""
                 if payload:
                     return payload
                 if fin_processed:
                     return b""
 
-            # If it is a pure ACK with no data/FIN, or an out-of-order packet, keep waiting
             continue
 
         return None
@@ -612,30 +658,57 @@ class RawTCPListener:
                 
                 print("Failed to complete handshake. Listening again...")
                     
+# if __name__ == "__main__":
+#     import random
+    
+#     random_src_port = random.randint(61000, 65535)
+    
+#     # NEW API: Pass src_ip, dst_ip, dst_port, and src_port directly into the constructor
+#     conn = RawTCPConnection("10.10.1.10", "10.10.3.10", 8080, random_src_port)
+    
+#     # NEW API: connect() no longer takes arguments
+#     if conn.connect():
+#         # Send an HTTP GET request
+#         http_request = b"GET / HTTP/1.1\r\nHost: 10.10.3.10\r\nConnection: close\r\n\r\n"
+#         conn.send_all(http_request)
+        
+#         # Receive the HTML response (using the new recv_until method)
+#         response = conn.recv_until(b"\r\n\r\n")
+        
+#         # If the server sends a body after the headers, fetch that too
+#         while True:
+#             chunk = conn.recv_some(timeout=2.0)
+#             if not chunk: 
+#                 break
+#             response += chunk
+            
+#         print("\n--- Server Response ---")
+#         print(response.decode('utf-8', errors='ignore'))
+        
+#         conn.close()
+
+
 if __name__ == "__main__":
     import random
     
     random_src_port = random.randint(61000, 65535)
     
-    # NEW API: Pass src_ip, dst_ip, dst_port, and src_port directly into the constructor
-    conn = RawTCPConnection("10.10.1.10", "10.10.3.10", 8080, random_src_port)
+    # 1. Use localhost IPs for local testing
+    conn = RawTCPConnection("127.0.0.1", "127.0.0.1", 8080, random_src_port)
     
-    # NEW API: connect() no longer takes arguments
     if conn.connect():
-        # Send an HTTP GET request
-        http_request = b"GET / HTTP/1.1\r\nHost: 10.10.3.10\r\nConnection: close\r\n\r\n"
+        # 2. Request a specific file that is larger than 1.5 KB to guarantee multiple packets
+        # If you didn't make a test.txt, change "/test.txt" back to "/" and ensure the directory has lots of files in it.
+        http_request = b"GET /test.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
         conn.send_all(http_request)
         
-        # Receive the HTML response (using the new recv_until method)
+        # 3. Receive the headers
         response = conn.recv_until(b"\r\n\r\n")
         
-        # If the server sends a body after the headers, fetch that too
-        while True:
-            chunk = conn.recv_some(timeout=2.0)
-            if not chunk: 
-                break
-            response += chunk
-            
+        # 4. Receive the body (this will trigger your simulated drops and OOO logic inside recv_all)
+        body = conn.recv_all(idle_timeout=10.0)
+        response += body
+        
         print("\n--- Server Response ---")
         print(response.decode('utf-8', errors='ignore'))
         
