@@ -227,6 +227,8 @@ class RawTCPConnection:
         self.early_data = b""  # Buffer for piggybacked data during handshake
         self.peer_closed = False
         self.out_of_order_buffer = {}  # {seq_number: payload_bytes}
+        self.peer_win = 65535  # Track the peer's advertised receive window
+        self.mss = DEFAULT_MSS  # Will be updated during handshake
 
     def connect(self):
         ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 24, ip_id=101)
@@ -257,6 +259,8 @@ class RawTCPConnection:
                     self.seq += 1
                     self.ack = parsed['seq'] + 1
                     syn_ack_received = True
+                    if parsed.get('mss'):
+                        self.mss = min(DEFAULT_MSS, parsed['mss'])
                     break
                     
             if syn_ack_received:
@@ -275,63 +279,120 @@ class RawTCPConnection:
         return True
 
     def send_all(self, data: bytes):
-        seq_at_send_start = self.seq
-        offset = 0
-        while offset < len(data):
-            chunk = data[offset:offset + DEFAULT_MSS]
-            ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20 + len(chunk), ip_id=103)
-            tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK | FLAG_PSH, payload=chunk)
-            packet = ip_hdr + tcp_seg
+        cwnd = float(self.mss)
+        ssthresh = 65535.0
+        dup_ack_count = 0
+        last_ack = self.seq
+        
+        send_base = 0 
+        send_next = 0 
+        timeout_count = 0  # NEW: Safeguard against infinite loops!
+        
+        while send_base < len(data):
+            # Calculate window, but force at least 1 byte (acts as a zero-window probe)
+            effective_window = max(1.0, min(cwnd, self.peer_win))
             
-            attempts = 0
-            while attempts < 10:
+            while (send_next - send_base) < effective_window and send_next < len(data):
+                # Calculate remaining window space
+                remaining_window = effective_window - (send_next - send_base)
+                chunk_len = min(self.mss, len(data) - send_next)
+                
+                # Truncate chunk to fit exactly within the available window
+                chunk_len = min(chunk_len, int(remaining_window))
+                if chunk_len <= 0:
+                    break
+                    
+                chunk = data[send_next : send_next + chunk_len]
+                ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20 + len(chunk), ip_id=103)
+                flags = FLAG_ACK | FLAG_PSH if (send_next + chunk_len == len(data)) else FLAG_ACK
+                
+                tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq + send_next, self.ack, flags, payload=chunk)
+                packet = ip_hdr + tcp_seg
+                
                 self.sock.sendto(packet, (self.dst_ip, 0))
                 self.logger.log("SEND", parse_packet(packet))
                 
-                start_time = time.time()
-                ack_received = False
+                send_next += len(chunk)
                 
-                while time.time() - start_time < 1.0:
-                    time_left = 1.0 - (time.time() - start_time)
-                    if time_left <= 0: break
+            ready, _, _ = select.select([self.sock], [], [], 1.0)
+            
+            if not ready:
+                timeout_count += 1
+                if timeout_count > 10:
+                    raise TimeoutError("send_all failed: 10 consecutive timeouts. Network partition or Deadlock.")
                     
-                    ready, _, _ = select.select([self.sock], [], [], time_left)
-                    if not ready: break
+                ssthresh = max(cwnd / 2.0, self.mss * 2.0)
+                cwnd = float(self.mss)
+                dup_ack_count = 0
+                send_next = send_base 
+                continue
+                
+            raw_bytes, _ = self.sock.recvfrom(65535)
+            parsed = parse_packet(raw_bytes)
+            
+            if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
+                continue
+                
+            if parsed['flags'] & FLAG_RST:
+                self.peer_closed = True
+                raise ConnectionResetError("Connection reset by peer during send_all")
+                
+            if parsed['flags'] & FLAG_ACK:
+                self.logger.log("RECV", parsed)
+                
+                self.peer_win = parsed['win']
+                
+                if parsed['len'] > 0 and parsed['seq'] == self.ack:
+                    self.early_data += parsed['payload']
+                    self.ack += parsed['len']
                     
-                    raw_bytes, _ = self.sock.recvfrom(65535)
-                    parsed = parse_packet(raw_bytes)
-                    if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
-                        continue
+                    ack_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=108)
+                    ack_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq + send_next, self.ack, FLAG_ACK)
+                    self.sock.sendto(ack_hdr + ack_seg, (self.dst_ip, 0))
+                    self.logger.log("SEND", parse_packet(ack_hdr + ack_seg))
+                
+                ack_seq = parsed['ack']
+                
+                if ack_seq > self.seq + send_base:
+                    bytes_acked = ack_seq - (self.seq + send_base)
+                    send_base += bytes_acked
+                    last_ack = ack_seq
+                    dup_ack_count = 0
+                    timeout_count = 0  # Reset timeout counter on successful progress!
                     
-                    # Drop connection immediately on RST
-                    if parsed['flags'] & FLAG_RST:
-                        self.peer_closed = True
-                        raise ConnectionResetError("Connection reset by peer during send_all")
-                    
-                    if parsed['flags'] & FLAG_ACK and parsed['ack'] > self.seq:
-                        self.logger.log("RECV", parsed)
-                        
-                        # Catch piggybacked data and ACK it immediately!
-                        if parsed['len'] > 0 and parsed['seq'] == self.ack:
-                            self.early_data += parsed['payload']
-                            self.ack += parsed['len']
-                            
-                            ack_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=108)
-                            ack_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
-                            self.sock.sendto(ack_hdr + ack_seg, (self.dst_ip, 0))
-                            self.logger.log("SEND", parse_packet(ack_hdr + ack_seg))
-                            
-                        self.seq += parsed['ack'] - self.seq
-                        offset = self.seq - seq_at_send_start
-                        ack_received = True
-                        break
-                            
-                if ack_received:
-                    break
-                attempts += 1
-            else:
-                raise TimeoutError(f"send_all failed: 10s timeout waiting for ACK on seq {self.seq}")
+                    if cwnd < ssthresh:
+                        cwnd += self.mss 
+                        state = "Slow Start"
+                    else:
+                        cwnd += (self.mss * self.mss) / cwnd 
+                        state = "Congestion Avoidance"
 
+                    ############################################
+                    # --- TEMPORARY PRINT TO WATCH RENO WORK ---
+                    # print(f"[RENO] State: {state} | cwnd: {cwnd:.1f} | ssthresh: {ssthresh} | Unacked Bytes: {send_next - send_base} | Peer Window: {self.peer_win}")
+                    # ------------------------------------------
+                    ############################################
+                        
+                elif ack_seq == last_ack:
+                    dup_ack_count += 1
+                    if dup_ack_count == 3:
+                        ssthresh = max(cwnd / 2.0, self.mss * 2.0)
+                        cwnd = ssthresh + (3.0 * self.mss)
+                        send_next = send_base 
+                        
+                        # Immediately retransmit the single missing segment!
+                        chunk_len = min(self.mss, len(data) - send_base)
+                        chunk = data[send_base : send_base + chunk_len]
+                        ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20 + len(chunk), ip_id=999)
+                        tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq + send_base, self.ack, FLAG_ACK, payload=chunk)
+                        
+                        self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+                        self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
+                        send_next += len(chunk)
+        
+        self.seq += len(data)
+                    
+                        
             
     def recv_all(self, idle_timeout: float = 10.0) -> bytes:
         """Drains early data, waits for FIN or absolute timeout (fixes the 2s premature cutoff)"""
@@ -634,6 +695,8 @@ class RawTCPListener:
                             self.logger.log("RECV", ack_parsed)
                             
                             conn = RawTCPConnection(local_ip, client_ip, client_port, self.src_port)
+                            if parsed.get('mss'):
+                                conn.mss = min(DEFAULT_MSS, parsed['mss'])
                             conn.logger = self.logger
                             conn.seq = server_seq + 1
                             conn.ack = ack_parsed['seq']
@@ -658,58 +721,59 @@ class RawTCPListener:
                 
                 print("Failed to complete handshake. Listening again...")
                     
-# if __name__ == "__main__":
-#     import random
-    
-#     random_src_port = random.randint(61000, 65535)
-    
-#     # NEW API: Pass src_ip, dst_ip, dst_port, and src_port directly into the constructor
-#     conn = RawTCPConnection("10.10.1.10", "10.10.3.10", 8080, random_src_port)
-    
-#     # NEW API: connect() no longer takes arguments
-#     if conn.connect():
-#         # Send an HTTP GET request
-#         http_request = b"GET / HTTP/1.1\r\nHost: 10.10.3.10\r\nConnection: close\r\n\r\n"
-#         conn.send_all(http_request)
-        
-#         # Receive the HTML response (using the new recv_until method)
-#         response = conn.recv_until(b"\r\n\r\n")
-        
-#         # If the server sends a body after the headers, fetch that too
-#         while True:
-#             chunk = conn.recv_some(timeout=2.0)
-#             if not chunk: 
-#                 break
-#             response += chunk
-            
-#         print("\n--- Server Response ---")
-#         print(response.decode('utf-8', errors='ignore'))
-        
-#         conn.close()
-
-
 if __name__ == "__main__":
     import random
     
     random_src_port = random.randint(61000, 65535)
     
-    # 1. Use localhost IPs for local testing
-    conn = RawTCPConnection("127.0.0.1", "127.0.0.1", 8080, random_src_port)
+    # 1. Point to the VM IPs instead of localhost
+    conn = RawTCPConnection("10.10.1.10", "10.10.3.10", 8080, random_src_port)
     
     if conn.connect():
-        # 2. Request a specific file that is larger than 1.5 KB to guarantee multiple packets
-        # If you didn't make a test.txt, change "/test.txt" back to "/" and ensure the directory has lots of files in it.
-        http_request = b"GET /test.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        # 2. Send a standard GET request so the server actually reads it
+        http_request = b"GET / HTTP/1.1\r\nHost: 10.10.3.10\r\nConnection: close\r\n\r\n"
         conn.send_all(http_request)
         
-        # 3. Receive the headers
+        # 3. Receive the response
         response = conn.recv_until(b"\r\n\r\n")
         
-        # 4. Receive the body (this will trigger your simulated drops and OOO logic inside recv_all)
-        body = conn.recv_all(idle_timeout=10.0)
-        response += body
-        
+        while True:
+            chunk = conn.recv_some(timeout=2.0)
+            if not chunk: 
+                break
+            response += chunk
+            
         print("\n--- Server Response ---")
         print(response.decode('utf-8', errors='ignore'))
         
         conn.close()
+
+
+# if __name__ == "__main__":
+#     import random
+    
+#     random_src_port = random.randint(61000, 65535)
+#     conn = RawTCPConnection("127.0.0.1", "127.0.0.1", 8080, random_src_port)
+    
+#     if conn.connect():
+#         # Create a massive 15 KB payload to force multiple MSS chunks
+#         dummy_body = b"A" * 15000 
+        
+#         # Build an HTTP POST request with the massive body
+#         http_request = (
+#             b"POST / HTTP/1.1\r\n"
+#             b"Host: 127.0.0.1\r\n"
+#             b"Content-Length: 15000\r\n"
+#             b"Connection: close\r\n\r\n"
+#         ) + dummy_body
+        
+#         print(f"Sending {len(http_request)} bytes to trigger Reno...")
+#         conn.send_all(http_request)
+        
+#         response = conn.recv_until(b"\r\n\r\n")
+#         body = conn.recv_all(idle_timeout=2.0)
+        
+#         print("\n--- Server Response ---")
+#         print((response + body).decode('utf-8', errors='ignore'))
+        
+#         conn.close()
