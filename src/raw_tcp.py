@@ -224,7 +224,8 @@ class RawTCPConnection:
         self.ack = 0
         self.dst_ip = None
         self.dst_port = None
-        self.logger = PacketLogger("client_tcp.log")
+        # self.logger = PacketLogger("client_tcp.log")
+        self.logger = PacketLogger(None)
 
     def connect(self, dst_ip: str, dst_port: int):
         self.dst_ip = dst_ip
@@ -236,14 +237,16 @@ class RawTCPConnection:
             self.seq, self.ack, FLAG_SYN, mss=DEFAULT_MSS
         )
 
-        # Retransmission Loop: Send SYN and wait 1.0s for SYN-ACK
-        while True:
+        # Retransmission Loop: Send SYN and wait 1.0s for SYN-ACK (Max 6 attempts)
+        attempts = 0
+        while attempts < 6:
             self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
-            self.logger.log("SND", parse_packet(ip_hdr + tcp_seg))
+            self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
 
             ready, _, _ = select.select([self.sock], [], [], 1.0)
             if not ready:
-                print("Timeout waiting for SYN-ACK, retransmitting SYN...")
+                attempts += 1
+                print(f"Timeout waiting for SYN-ACK ({attempts}/6), retransmitting SYN...")
                 continue
 
             raw_bytes, _ = self.sock.recvfrom(65535)
@@ -253,10 +256,14 @@ class RawTCPConnection:
                 continue
 
             if parsed['flags'] == (FLAG_SYN | FLAG_ACK) and parsed['ack'] == self.seq + 1:
-                self.logger.log("RCV", parsed)
+                self.logger.log("RECV", parsed)
                 self.seq += 1
                 self.ack = parsed['seq'] + 1
                 break
+        else:
+            # This executes if the loop finishes without hitting 'break'
+            print("Handshake failed: Max retransmissions reached for SYN.")
+            return False
 
         # Send final ACK
         ip_hdr_ack = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=102)
@@ -265,11 +272,11 @@ class RawTCPConnection:
             self.seq, self.ack, FLAG_ACK
         )
         self.sock.sendto(ip_hdr_ack + tcp_seg_ack, (self.dst_ip, 0))
-        self.logger.log("SND", parse_packet(ip_hdr_ack + tcp_seg_ack))
+        self.logger.log("SEND", parse_packet(ip_hdr_ack + tcp_seg_ack))
         
         print(f"Connection established with {self.dst_ip}:{self.dst_port}!")
         return True
-
+    
     def send_all(self, data: bytes):
         offset = 0
         while offset < len(data):
@@ -286,7 +293,7 @@ class RawTCPConnection:
             # Retransmission Loop: Send data chunk and wait 1.0s for ACK
             while True:
                 self.sock.sendto(packet, (self.dst_ip, 0))
-                self.logger.log("SND", parse_packet(packet))
+                self.logger.log("SEND", parse_packet(packet))
                 
                 ready, _, _ = select.select([self.sock], [], [], 1.0)
                 if not ready:
@@ -301,7 +308,7 @@ class RawTCPConnection:
                 
                 # Check for valid ACK
                 if parsed['flags'] & FLAG_ACK:
-                    self.logger.log("RCV", parsed)
+                    self.logger.log("RECV", parsed)
                     # Cumulative ACK check: if the peer acknowledges data beyond our current sequence
                     if parsed['ack'] > self.seq:
                         bytes_acked = parsed['ack'] - self.seq
@@ -324,7 +331,7 @@ class RawTCPConnection:
             if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
                 continue
                 
-            self.logger.log("RCV", parsed)
+            self.logger.log("RECV", parsed)
             
             # Process in-order payload
             if parsed['len'] > 0:
@@ -339,7 +346,7 @@ class RawTCPConnection:
                     self.seq, self.ack, FLAG_ACK
                 )
                 self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
-                self.logger.log("SND", parse_packet(ip_hdr + tcp_seg))
+                self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
                 
             # Handle Server FIN (Teardown)
             if parsed['flags'] & FLAG_FIN:
@@ -350,7 +357,7 @@ class RawTCPConnection:
                     self.seq, self.ack, FLAG_ACK
                 )
                 self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
-                self.logger.log("SND", parse_packet(ip_hdr + tcp_seg))
+                self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
                 break
                 
         return received_data
@@ -364,7 +371,7 @@ class RawTCPConnection:
         
         while True:
             self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
-            self.logger.log("SND", parse_packet(ip_hdr + tcp_seg))
+            self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
             
             ready, _, _ = select.select([self.sock], [], [], 1.0)
             if not ready:
@@ -377,10 +384,45 @@ class RawTCPConnection:
                 continue
             
             if parsed['flags'] & FLAG_ACK:
-                self.logger.log("RCV", parsed)
+                self.logger.log("RECV", parsed)
                 break
         
         self.sock.close()
+
+    def recv_some(self, timeout: float = 1.0):
+        """Return arriving bytes, b'' if peer closed, or None on timeout."""
+        ready, _, _ = select.select([self.sock], [], [], timeout)
+        if not ready:
+            return None
+
+        raw_bytes, _ = self.sock.recvfrom(65535)
+        parsed = parse_packet(raw_bytes)
+
+        if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
+            return b""  # Ignore spurious packets
+
+        self.logger.log("RECV", parsed)
+
+        # Handle FIN
+        if parsed['flags'] & FLAG_FIN:
+            self.ack += 1
+            ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=999)
+            tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
+            self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+            self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
+            return b""
+
+        # Handle Data
+        if parsed['len'] > 0 and parsed['seq'] == self.ack:
+            payload = parsed['payload']
+            self.ack += parsed['len']
+            ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=998)
+            tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
+            self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+            self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
+            return payload
+
+        return b""
 
 class RawTCPListener:
     """Server-side TCP listener to accept incoming raw connections."""
@@ -390,38 +432,34 @@ class RawTCPListener:
         
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        self.logger = PacketLogger("server_tcp.log")
+        # self.logger = PacketLogger("server_tcp.log")
+        self.logger = PacketLogger(None)
 
     def accept(self):
-        print(f"Listening for incoming connections on {self.src_ip}:{self.src_port}...")
         while True:
-            # Step 1: Wait for SYN
             raw_bytes, _ = self.sock.recvfrom(65535)
             parsed = parse_packet(raw_bytes)
             
-            if not parsed or parsed['dst_ip'] != self.src_ip or parsed['dport'] != self.src_port:
-                continue
+            if not parsed or parsed['dport'] != self.src_port: continue
+            
+            # Allow any local IP if bound to 0.0.0.0
+            if self.src_ip != "0.0.0.0" and parsed['dst_ip'] != self.src_ip: continue
                 
             if parsed['flags'] == FLAG_SYN:
-                self.logger.log("RCV", parsed)
-                client_ip = parsed['src_ip']
-                client_port = parsed['sport']
+                self.logger.log("RECV", parsed)
+                client_ip, client_port = parsed['src_ip'], parsed['sport']
+                local_ip = parsed['dst_ip']  # Extract the actual IP the SYN hit
                 
-                # Generate server's Initial Sequence Number
-                server_seq = random.randint(1000, 50000)
-                server_ack = parsed['seq'] + 1
+                server_seq, server_ack = random.randint(1000, 50000), parsed['seq'] + 1
                 
-                # Step 2: Send SYN-ACK
-                ip_hdr = build_ipv4_header(self.src_ip, client_ip, 24, ip_id=201)
-                tcp_seg = build_tcp_segment(
-                    self.src_ip, client_ip, self.src_port, client_port,
-                    server_seq, server_ack, FLAG_SYN | FLAG_ACK, mss=DEFAULT_MSS
-                )
+                # Use local_ip here, not self.src_ip
+                ip_hdr = build_ipv4_header(local_ip, client_ip, 24, ip_id=201)
+                tcp_seg = build_tcp_segment(local_ip, client_ip, self.src_port, client_port, server_seq, server_ack, FLAG_SYN | FLAG_ACK, mss=DEFAULT_MSS)
                 
                 # Retransmission loop for SYN-ACK
                 while True:
                     self.sock.sendto(ip_hdr + tcp_seg, (client_ip, 0))
-                    self.logger.log("SND", parse_packet(ip_hdr + tcp_seg))
+                    self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
                     
                     ready, _, _ = select.select([self.sock], [], [], 1.0)
                     if not ready:
@@ -436,17 +474,16 @@ class RawTCPListener:
                         
                     # Step 3: Receive final ACK
                     if ack_parsed['flags'] == FLAG_ACK and ack_parsed['ack'] == server_seq + 1:
-                        self.logger.log("RCV", ack_parsed)
+                        self.logger.log("RECV", ack_parsed)
                         print(f"Connection accepted from {client_ip}:{client_port}!")
                         
                         # Create an established connection object to return
-                        conn = RawTCPConnection(self.src_ip, self.src_port)
-                        # Override the default connection properties with the established state
+                        conn = RawTCPConnection(local_ip, self.src_port)
+                        conn.logger = self.logger  # Inherit the listener's log file
                         conn.dst_ip = client_ip
                         conn.dst_port = client_port
                         conn.seq = server_seq + 1
                         conn.ack = ack_parsed['seq']
-                        
                         return conn
 
                     
