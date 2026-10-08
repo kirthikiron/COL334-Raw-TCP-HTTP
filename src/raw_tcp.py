@@ -114,6 +114,7 @@ def parse_packet(raw_bytes: bytes):
     # Verify IPv4 header checksum (T4)
     if internet_checksum(raw_bytes[:ihl]) != 0:
         return None
+        #pass
 
     _, _, total_len, ip_id, _, ttl, proto, _, src_addr, dst_addr = struct.unpack(
         "!BBHHHBBH4s4s", raw_bytes[:20]
@@ -141,6 +142,7 @@ def parse_packet(raw_bytes: bytes):
     # Only drop the packet for invalid checksums if we are NOT on localhost
     if src_ip != "127.0.0.1" and internet_checksum(pseudo_hdr + tcp_segment) != 0:
             return None
+            #pass
 
     # Parse TCP options (T4: extract peer's MSS if present, ignore others)
     mss = None
@@ -616,12 +618,12 @@ if __name__ == "__main__":
     random_src_port = random.randint(61000, 65535)
     
     # NEW API: Pass src_ip, dst_ip, dst_port, and src_port directly into the constructor
-    conn = RawTCPConnection("127.0.0.1", "127.0.0.1", 8080, random_src_port)
+    conn = RawTCPConnection("10.10.1.10", "10.10.3.10", 8080, random_src_port)
     
     # NEW API: connect() no longer takes arguments
     if conn.connect():
         # Send an HTTP GET request
-        http_request = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        http_request = b"GET / HTTP/1.1\r\nHost: 10.10.3.10\r\nConnection: close\r\n\r\n"
         conn.send_all(http_request)
         
         # Receive the HTML response (using the new recv_until method)
