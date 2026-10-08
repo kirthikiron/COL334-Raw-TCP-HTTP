@@ -209,121 +209,144 @@ class PacketLogger:
 
 
 class RawTCPConnection:
-    def __init__(self, src_ip: str, src_port: int):
+    def __init__(self, src_ip: str, dst_ip: str, dst_port: int, src_port: int = None, log_path: str = None):
         self.src_ip = src_ip
-        self.src_port = src_port
-        
-        # Open a raw socket
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-        
-        # Tell the OS we are building our own IP headers
-        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        
-        # TCP State variables
-        self.seq = random.randint(1000, 50000)
-        self.ack = 0
-        self.dst_ip = None
-        self.dst_port = None
-        # self.logger = PacketLogger("client_tcp.log")
-        self.logger = PacketLogger(None)
-
-    def connect(self, dst_ip: str, dst_port: int):
         self.dst_ip = dst_ip
         self.dst_port = dst_port
+        # Pick ephemeral port in correct range if not provided
+        self.src_port = src_port if src_port else random.randint(61000, 65535)
+        
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        
+        self.seq = random.randint(1000, 50000)
+        self.ack = 0
+        self.logger = PacketLogger(log_path)
+        self.early_data = b""  # Buffer for piggybacked data during handshake
+        self.peer_closed = False
 
+    def connect(self):
         ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 24, ip_id=101)
-        tcp_seg = build_tcp_segment(
-            self.src_ip, self.dst_ip, self.src_port, self.dst_port,
-            self.seq, self.ack, FLAG_SYN, mss=DEFAULT_MSS
-        )
+        tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_SYN, mss=DEFAULT_MSS)
 
-        # Retransmission Loop: Send SYN and wait 1.0s for SYN-ACK (Max 6 attempts)
         attempts = 0
         while attempts < 6:
             self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
             self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
 
-            ready, _, _ = select.select([self.sock], [], [], 1.0)
-            if not ready:
-                attempts += 1
-                print(f"Timeout waiting for SYN-ACK ({attempts}/6), retransmitting SYN...")
-                continue
-
-            raw_bytes, _ = self.sock.recvfrom(65535)
-            parsed = parse_packet(raw_bytes)
+            start_time = time.time()
+            syn_ack_received = False
             
-            if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
-                continue
+            while time.time() - start_time < 1.0:
+                time_left = 1.0 - (time.time() - start_time)
+                if time_left <= 0: break
+                
+                ready, _, _ = select.select([self.sock], [], [], time_left)
+                if not ready: break
 
-            if parsed['flags'] == (FLAG_SYN | FLAG_ACK) and parsed['ack'] == self.seq + 1:
-                self.logger.log("RECV", parsed)
-                self.seq += 1
-                self.ack = parsed['seq'] + 1
+                raw_bytes, _ = self.sock.recvfrom(65535)
+                parsed = parse_packet(raw_bytes)
+                if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
+                    continue
+
+                if parsed['flags'] == (FLAG_SYN | FLAG_ACK) and parsed['ack'] == self.seq + 1:
+                    self.logger.log("RECV", parsed)
+                    self.seq += 1
+                    self.ack = parsed['seq'] + 1
+                    syn_ack_received = True
+                    break
+                    
+            if syn_ack_received:
                 break
+                
+            attempts += 1
         else:
-            # This executes if the loop finishes without hitting 'break'
             print("Handshake failed: Max retransmissions reached for SYN.")
             return False
 
-        # Send final ACK
         ip_hdr_ack = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=102)
-        tcp_seg_ack = build_tcp_segment(
-            self.src_ip, self.dst_ip, self.src_port, self.dst_port,
-            self.seq, self.ack, FLAG_ACK
-        )
+        tcp_seg_ack = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
         self.sock.sendto(ip_hdr_ack + tcp_seg_ack, (self.dst_ip, 0))
         self.logger.log("SEND", parse_packet(ip_hdr_ack + tcp_seg_ack))
-        
         print(f"Connection established with {self.dst_ip}:{self.dst_port}!")
         return True
-    
+
     def send_all(self, data: bytes):
+        seq_at_send_start = self.seq
         offset = 0
         while offset < len(data):
-            # Slice data into MSS-sized chunks
             chunk = data[offset:offset + DEFAULT_MSS]
             ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20 + len(chunk), ip_id=103)
-            tcp_seg = build_tcp_segment(
-                self.src_ip, self.dst_ip, self.src_port, self.dst_port,
-                self.seq, self.ack, FLAG_ACK | FLAG_PSH, payload=chunk
-            )
-            
+            tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK | FLAG_PSH, payload=chunk)
             packet = ip_hdr + tcp_seg
             
-            # Retransmission Loop: Send data chunk and wait 1.0s for ACK
-            while True:
+            attempts = 0
+            while attempts < 10:
                 self.sock.sendto(packet, (self.dst_ip, 0))
                 self.logger.log("SEND", parse_packet(packet))
                 
-                ready, _, _ = select.select([self.sock], [], [], 1.0)
-                if not ready:
-                    print(f"Timeout waiting for ACK for seq {self.seq}, retransmitting data...")
-                    continue
+                start_time = time.time()
+                ack_received = False
                 
-                raw_bytes, _ = self.sock.recvfrom(65535)
-                parsed = parse_packet(raw_bytes)
-                
-                if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
-                    continue
-                
-                # Check for valid ACK
-                if parsed['flags'] & FLAG_ACK:
-                    self.logger.log("RECV", parsed)
-                    # Cumulative ACK check: if the peer acknowledges data beyond our current sequence
-                    if parsed['ack'] > self.seq:
-                        bytes_acked = parsed['ack'] - self.seq
-                        self.seq += bytes_acked
-                        offset += bytes_acked
+                while time.time() - start_time < 1.0:
+                    time_left = 1.0 - (time.time() - start_time)
+                    if time_left <= 0: break
+                    
+                    ready, _, _ = select.select([self.sock], [], [], time_left)
+                    if not ready: break
+                    
+                    raw_bytes, _ = self.sock.recvfrom(65535)
+                    parsed = parse_packet(raw_bytes)
+                    if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
+                        continue
+                    
+                    # Drop connection immediately on RST
+                    if parsed['flags'] & FLAG_RST:
+                        self.peer_closed = True
+                        raise ConnectionResetError("Connection reset by peer during send_all")
+                    
+                    if parsed['flags'] & FLAG_ACK and parsed['ack'] > self.seq:
+                        self.logger.log("RECV", parsed)
+                        
+                        # Catch piggybacked data and ACK it immediately!
+                        if parsed['len'] > 0 and parsed['seq'] == self.ack:
+                            self.early_data += parsed['payload']
+                            self.ack += parsed['len']
+                            
+                            ack_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=108)
+                            ack_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
+                            self.sock.sendto(ack_hdr + ack_seg, (self.dst_ip, 0))
+                            self.logger.log("SEND", parse_packet(ack_hdr + ack_seg))
+                            
+                        self.seq += parsed['ack'] - self.seq
+                        offset = self.seq - seq_at_send_start
+                        ack_received = True
                         break
+                            
+                if ack_received:
+                    break
+                attempts += 1
+            else:
+                raise TimeoutError(f"send_all failed: 10s timeout waiting for ACK on seq {self.seq}")
 
-    def recv_all(self) -> bytes:
+            
+    def recv_all(self, idle_timeout: float = 10.0) -> bytes:
+        """Drains early data, waits for FIN or absolute timeout (fixes the 2s premature cutoff)"""
         received_data = b""
+        if self.early_data:
+            received_data += self.early_data
+            self.early_data = b""
         
-        # Loop until the connection is closed or data stops arriving
+        last_data_time = time.time()
+        
         while True:
-            ready, _, _ = select.select([self.sock], [], [], 2.0)
+            time_left = idle_timeout - (time.time() - last_data_time)
+            if time_left <= 0:
+                break
+                
+            ready, _, _ = select.select([self.sock], [], [], time_left)
             if not ready:
-                break # Timeout assuming the server has finished sending data
+                break 
                 
             raw_bytes, _ = self.sock.recvfrom(65535)
             parsed = parse_packet(raw_bytes)
@@ -333,107 +356,192 @@ class RawTCPConnection:
                 
             self.logger.log("RECV", parsed)
             
-            # Process in-order payload
-            if parsed['len'] > 0:
-                if parsed['seq'] == self.ack:
-                    received_data += parsed['payload']
-                    self.ack += parsed['len']
+            # Drop connection immediately on RST
+            if parsed['flags'] & FLAG_RST:
+                self.peer_closed = True
+                break
+            
+            if parsed['len'] > 0 and parsed['seq'] == self.ack:
+                received_data += parsed['payload']
+                self.ack += parsed['len']
+                last_data_time = time.time()
                     
-                # Acknowledge the received data
                 ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=104)
-                tcp_seg = build_tcp_segment(
-                    self.src_ip, self.dst_ip, self.src_port, self.dst_port,
-                    self.seq, self.ack, FLAG_ACK
-                )
+                tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
                 self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
                 self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
                 
-            # Handle Server FIN (Teardown)
             if parsed['flags'] & FLAG_FIN:
-                self.ack += 1
-                ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=105)
-                tcp_seg = build_tcp_segment(
-                    self.src_ip, self.dst_ip, self.src_port, self.dst_port,
-                    self.seq, self.ack, FLAG_ACK
-                )
-                self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
-                self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
-                break
+                if parsed['seq'] + parsed['len'] == self.ack:
+                    self.ack += 1
+                    ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=105)
+                    tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
+                    self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+                    self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
+                    self.peer_closed = True
+                    break
                 
         return received_data
 
     def close(self):
         ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=106)
-        tcp_seg = build_tcp_segment(
-            self.src_ip, self.dst_ip, self.src_port, self.dst_port,
-            self.seq, self.ack, FLAG_FIN | FLAG_ACK
-        )
+        tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_FIN | FLAG_ACK)
         
-        while True:
+        # 1. Send FIN and wait for ACK (Give up after 2s / 4 attempts)
+        attempts = 0
+        fin_acked = False
+        peer_fin_received = False
+        
+        while attempts < 4 and not fin_acked:
             self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
             self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
             
-            ready, _, _ = select.select([self.sock], [], [], 1.0)
-            if not ready:
-                continue # Retransmit FIN
+            start_time = time.time()
+            while time.time() - start_time < 0.5:
+                time_left = 0.5 - (time.time() - start_time)
+                if time_left <= 0: break
                 
-            raw_bytes, _ = self.sock.recvfrom(65535)
-            parsed = parse_packet(raw_bytes)
-            
-            if not parsed or parsed['src_ip'] != self.dst_ip: 
-                continue
-            
-            if parsed['flags'] & FLAG_ACK:
+                ready, _, _ = select.select([self.sock], [], [], time_left)
+                if not ready: break
+                
+                raw_bytes, _ = self.sock.recvfrom(65535)
+                parsed = parse_packet(raw_bytes)
+                if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
+                    continue
+                    
                 self.logger.log("RECV", parsed)
-                break
+                
+                # Check for piggybacked FIN
+                if parsed['flags'] & FLAG_FIN:
+                    peer_fin_received = True
+                    if parsed['seq'] + parsed['len'] == self.ack:
+                        self.ack += 1
+                
+                if parsed['flags'] & FLAG_ACK and parsed['ack'] == self.seq + 1:
+                    fin_acked = True
+                    break
+            attempts += 1
+            
+        self.seq += 1
         
+        # 2. Wait up to 2 seconds for peer's FIN ONLY if we haven't seen it yet
+        if not peer_fin_received:
+            start_time = time.time()
+            while time.time() - start_time < 2.0:
+                ready, _, _ = select.select([self.sock], [], [], 2.0 - (time.time() - start_time))
+                if not ready: break
+                
+                raw_bytes, _ = self.sock.recvfrom(65535)
+                parsed = parse_packet(raw_bytes)
+                if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
+                    continue
+                
+                self.logger.log("RECV", parsed)
+                if parsed['flags'] & FLAG_FIN:
+                    if parsed['seq'] + parsed['len'] == self.ack:
+                        self.ack += 1
+                    break
+        
+        # 3. Send final ACK for the peer's FIN
+        ip_hdr_f = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=107)
+        tcp_seg_f = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
+        self.sock.sendto(ip_hdr_f + tcp_seg_f, (self.dst_ip, 0))
+        self.logger.log("SEND", parse_packet(ip_hdr_f + tcp_seg_f))
+        
+        self.peer_closed = True
         self.sock.close()
+
 
     def recv_some(self, timeout: float = 1.0):
         """Return arriving bytes, b'' if peer closed, or None on timeout."""
-        ready, _, _ = select.select([self.sock], [], [], timeout)
-        if not ready:
-            return None
-
-        raw_bytes, _ = self.sock.recvfrom(65535)
-        parsed = parse_packet(raw_bytes)
-
-        if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
-            return b""  # Ignore spurious packets
-
-        self.logger.log("RECV", parsed)
-
-        # Handle FIN
-        if parsed['flags'] & FLAG_FIN:
-            self.ack += 1
-            ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=999)
-            tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
-            self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
-            self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
+        # If we already closed the connection, return b"" immediately
+        if getattr(self, 'peer_closed', False):
             return b""
+            
+        # Return piggybacked data from the handshake if it exists
+        if self.early_data:
+            data = self.early_data
+            self.early_data = b""
+            return data
 
-        # Handle Data
-        if parsed['len'] > 0 and parsed['seq'] == self.ack:
-            payload = parsed['payload']
-            self.ack += parsed['len']
-            ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=998)
-            tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
-            self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
-            self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
-            return payload
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            time_left = timeout - (time.time() - start_time)
+            if time_left <= 0:
+                break
+                
+            ready, _, _ = select.select([self.sock], [], [], time_left)
+            if not ready:
+                return None  # Real timeout
 
-        return b""
+            raw_bytes, _ = self.sock.recvfrom(65535)
+            parsed = parse_packet(raw_bytes)
+
+            # Ignore background network noise
+            if not parsed or parsed['src_ip'] != self.dst_ip or parsed['dport'] != self.src_port:
+                continue 
+
+            # Drop connection on RST
+            if parsed['flags'] & FLAG_RST:
+                self.peer_closed = True
+                return b""
+
+            self.logger.log("RECV", parsed)
+
+            payload = b""
+            # 1. Process Data First
+            if parsed['len'] > 0 and parsed['seq'] == self.ack:
+                payload = parsed['payload']
+                self.ack += parsed['len']
+            
+            # 2. Process FIN (FIN occupies 1 sequence number after the payload)
+            fin_processed = False
+            if (parsed['flags'] & FLAG_FIN) and (parsed['seq'] + parsed['len'] == self.ack):
+                self.ack += 1
+                self.peer_closed = True
+                fin_processed = True
+                
+            # 3. Send one ACK if we consumed data or a FIN
+            if payload or fin_processed:
+                ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=998)
+                tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
+                self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+                self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
+                
+                # If there was data, return it first. Next call to recv_some will return b""
+                if payload:
+                    return payload
+                if fin_processed:
+                    return b""
+
+            # If it is a pure ACK with no data/FIN, or an out-of-order packet, keep waiting
+            continue
+
+        return None
+
+    def recv_until(self, delim: bytes, timeout: float = 5.0) -> bytes:
+        """Buffer data until delimiter is found or timeout occurs."""
+        buffer = b""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            chunk = self.recv_some(timeout=0.5)
+            if chunk:
+                buffer += chunk
+                if delim in buffer:
+                    return buffer
+            elif chunk == b"": # Connection closed by peer
+                break
+        return buffer
 
 class RawTCPListener:
     """Server-side TCP listener to accept incoming raw connections."""
-    def __init__(self, src_ip: str, src_port: int):
+    def __init__(self, src_ip: str, src_port: int, log_path: str = None):
         self.src_ip = src_ip
         self.src_port = src_port
         
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        # self.logger = PacketLogger("server_tcp.log")
-        self.logger = PacketLogger(None)
+        self.logger = PacketLogger(log_path)
 
     def accept(self):
         while True:
@@ -441,65 +549,91 @@ class RawTCPListener:
             parsed = parse_packet(raw_bytes)
             
             if not parsed or parsed['dport'] != self.src_port: continue
-            
-            # Allow any local IP if bound to 0.0.0.0
             if self.src_ip != "0.0.0.0" and parsed['dst_ip'] != self.src_ip: continue
                 
             if parsed['flags'] == FLAG_SYN:
                 self.logger.log("RECV", parsed)
                 client_ip, client_port = parsed['src_ip'], parsed['sport']
-                local_ip = parsed['dst_ip']  # Extract the actual IP the SYN hit
+                local_ip = parsed['dst_ip'] 
                 
                 server_seq, server_ack = random.randint(1000, 50000), parsed['seq'] + 1
-                
-                # Use local_ip here, not self.src_ip
                 ip_hdr = build_ipv4_header(local_ip, client_ip, 24, ip_id=201)
                 tcp_seg = build_tcp_segment(local_ip, client_ip, self.src_port, client_port, server_seq, server_ack, FLAG_SYN | FLAG_ACK, mss=DEFAULT_MSS)
                 
-                # Retransmission loop for SYN-ACK
-                while True:
+                attempts = 0
+                while attempts < 6:
                     self.sock.sendto(ip_hdr + tcp_seg, (client_ip, 0))
                     self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
                     
-                    ready, _, _ = select.select([self.sock], [], [], 1.0)
-                    if not ready:
-                        print("Timeout waiting for client ACK, retransmitting SYN-ACK...")
-                        continue
-                        
-                    ack_bytes, _ = self.sock.recvfrom(65535)
-                    ack_parsed = parse_packet(ack_bytes)
+                    # Inner loop prevents spurious packets from resetting the 1.0s timer
+                    start_time = time.time()
+                    ack_received = False
                     
-                    if not ack_parsed or ack_parsed['src_ip'] != client_ip or ack_parsed['sport'] != client_port:
-                        continue
+                    while time.time() - start_time < 1.0:
+                        time_left = 1.0 - (time.time() - start_time)
+                        if time_left <= 0: break
                         
-                    # Step 3: Receive final ACK
-                    if ack_parsed['flags'] == FLAG_ACK and ack_parsed['ack'] == server_seq + 1:
-                        self.logger.log("RECV", ack_parsed)
+                        ready, _, _ = select.select([self.sock], [], [], time_left)
+                        if not ready: break
+                        
+                        ack_bytes, _ = self.sock.recvfrom(65535)
+                        ack_parsed = parse_packet(ack_bytes)
+                        
+                        if not ack_parsed or ack_parsed['src_ip'] != client_ip or ack_parsed['sport'] != client_port:
+                            continue
+                            
+                        if ack_parsed['flags'] & FLAG_ACK and ack_parsed['ack'] == server_seq + 1:
+                            self.logger.log("RECV", ack_parsed)
+                            
+                            conn = RawTCPConnection(local_ip, client_ip, client_port, self.src_port)
+                            conn.logger = self.logger
+                            conn.seq = server_seq + 1
+                            conn.ack = ack_parsed['seq']
+                            
+                            # Catch piggybacked data and ACK it immediately!
+                            if ack_parsed['len'] > 0:
+                                conn.early_data = ack_parsed['payload']
+                                conn.ack += ack_parsed['len']
+                                ack_hdr = build_ipv4_header(conn.src_ip, conn.dst_ip, 20, ip_id=202)
+                                ack_seg = build_tcp_segment(conn.src_ip, conn.dst_ip, conn.src_port, conn.dst_port, conn.seq, conn.ack, FLAG_ACK)
+                                conn.sock.sendto(ack_hdr + ack_seg, (conn.dst_ip, 0))
+                                conn.logger.log("SEND", parse_packet(ack_hdr + ack_seg))
+                                
+                            ack_received = True
+                            break
+                            
+                    if ack_received:
                         print(f"Connection accepted from {client_ip}:{client_port}!")
-                        
-                        # Create an established connection object to return
-                        conn = RawTCPConnection(local_ip, self.src_port)
-                        conn.logger = self.logger  # Inherit the listener's log file
-                        conn.dst_ip = client_ip
-                        conn.dst_port = client_port
-                        conn.seq = server_seq + 1
-                        conn.ack = ack_parsed['seq']
                         return conn
-
+                        
+                    attempts += 1
+                
+                print("Failed to complete handshake. Listening again...")
                     
 if __name__ == "__main__":
     import random
     
-    random_src_port = random.randint(10000, 60000)
-    conn = RawTCPConnection("127.0.0.1", random_src_port)
+    random_src_port = random.randint(61000, 65535)
     
-    if conn.connect("127.0.0.1", 8080):
+    # NEW API: Pass src_ip, dst_ip, dst_port, and src_port directly into the constructor
+    conn = RawTCPConnection("127.0.0.1", "127.0.0.1", 8080, random_src_port)
+    
+    # NEW API: connect() no longer takes arguments
+    if conn.connect():
         # Send an HTTP GET request
         http_request = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
         conn.send_all(http_request)
         
-        # Receive the HTML response
-        response = conn.recv_all()
+        # Receive the HTML response (using the new recv_until method)
+        response = conn.recv_until(b"\r\n\r\n")
+        
+        # If the server sends a body after the headers, fetch that too
+        while True:
+            chunk = conn.recv_some(timeout=2.0)
+            if not chunk: 
+                break
+            response += chunk
+            
         print("\n--- Server Response ---")
         print(response.decode('utf-8', errors='ignore'))
         
