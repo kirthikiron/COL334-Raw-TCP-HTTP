@@ -12,12 +12,12 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ---- DEV ONLY (delete this block before submitting) -----------------------
-if os.environ.get("MOCK_TCP_DIR"):
-    sys.path.insert(0, os.environ["MOCK_TCP_DIR"])
-    from mock_tcp import RawTCPListener
-# ---------------------------------------------------------------------------
-else:
-    from raw_tcp import RawTCPListener
+# if os.environ.get("MOCK_TCP_DIR"):
+#     sys.path.insert(0, os.environ["MOCK_TCP_DIR"])
+#     from mock_tcp import RawTCPListener
+# # ---------------------------------------------------------------------------
+# else:
+from raw_tcp import RawTCPListener
 
 HEAD_TIMEOUT = 10.0
 MAX_HEAD = 65536

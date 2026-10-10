@@ -16,12 +16,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ---- DEV ONLY (delete this block before submitting) -----------------------
 # Set MOCK_TCP_DIR to the folder containing mock_tcp.py to test on Windows.
-if os.environ.get("MOCK_TCP_DIR"):
-    sys.path.insert(0, os.environ["MOCK_TCP_DIR"])
-    from mock_tcp import RawTCPConnection
-# ---------------------------------------------------------------------------
-else:
-    from raw_tcp import RawTCPConnection
+# if os.environ.get("MOCK_TCP_DIR"):
+#     sys.path.insert(0, os.environ["MOCK_TCP_DIR"])
+#     from mock_tcp import RawTCPConnection
+# # ---------------------------------------------------------------------------
+# else:
+from raw_tcp import RawTCPConnection
 
 
 # ------------------------------ pure helpers -------------------------------
