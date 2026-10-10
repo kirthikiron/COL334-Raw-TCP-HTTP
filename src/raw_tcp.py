@@ -229,6 +229,7 @@ class RawTCPConnection:
         self.out_of_order_buffer = {}  # {seq_number: payload_bytes}
         self.peer_win = 65535  # Track the peer's advertised receive window
         self.mss = DEFAULT_MSS  # Will be updated during handshake
+        self.ack_floor = 0  # Track the lowest unacknowledged sequence number to prevent ACK regression
 
     def connect(self):
         ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 24, ip_id=101)
@@ -277,6 +278,15 @@ class RawTCPConnection:
         self.logger.log("SEND", parse_packet(ip_hdr_ack + tcp_seg_ack))
         print(f"Connection established with {self.dst_ip}:{self.dst_port}!")
         return True
+
+    def _send_ack(self, ip_id):
+        if self.ack < self.ack_floor:
+            self.ack = self.ack_floor
+        self.ack_floor = self.ack
+        ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=ip_id)
+        tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
+        self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+        self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
 
     def send_all(self, data: bytes):
         cwnd = float(self.mss)
@@ -345,11 +355,12 @@ class RawTCPConnection:
                 if parsed['len'] > 0 and parsed['seq'] == self.ack:
                     self.early_data += parsed['payload']
                     self.ack += parsed['len']
-                    
-                    ack_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=108)
-                    ack_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq + send_next, self.ack, FLAG_ACK)
-                    self.sock.sendto(ack_hdr + ack_seg, (self.dst_ip, 0))
-                    self.logger.log("SEND", parse_packet(ack_hdr + ack_seg))
+
+                    ################################################
+                    # ack_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=108)
+                    # ack_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq + send_next, self.ack, FLAG_ACK)
+                    # self.sock.sendto(ack_hdr + ack_seg, (self.dst_ip, 0))
+                    # self.logger.log("SEND", parse_packet(ack_hdr + ack_seg))
                 
                 ack_seq = parsed['ack']
                 
@@ -400,6 +411,7 @@ class RawTCPConnection:
         if self.early_data:
             received_data += self.early_data
             self.early_data = b""
+            self._send_ack(104)
         
         last_data_time = time.time()
         
@@ -457,28 +469,33 @@ class RawTCPConnection:
                     dup_ack_needed = True
                     
                 # Always ACK in-order data, or send a Dup-ACK for out-of-order/duplicate data
-                ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=104)
-                tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
-                self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
-                self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
+                ################################################
+                # ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=104)
+                # tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
+                # self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+                # self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
+                self._send_ack(104)
                 
             if parsed['flags'] & FLAG_FIN:
                 if parsed['seq'] + parsed['len'] == self.ack:
                     self.ack += 1
-                    ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=105)
-                    tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
-                    self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
-                    self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
+                    #########################################
+                    # ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=105)
+                    # tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
+                    # self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+                    # self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
+                    self._send_ack(105)
                     self.peer_closed = True
                     break
                 
         return received_data
 
     def close(self):
+        self.ack = max(self.ack, self.ack_floor)
         ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=106)
         tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_FIN | FLAG_ACK)
         
-        # 1. Send FIN and wait for ACK (Give up after 2s / 4 attempts)
+        # Send FIN and wait for ACK (Give up after 2s / 4 attempts)
         attempts = 0
         fin_acked = False
         peer_fin_received = False
@@ -515,7 +532,7 @@ class RawTCPConnection:
             
         self.seq += 1
         
-        # 2. Wait up to 2 seconds for peer's FIN ONLY if we haven't seen it yet
+        # Wait up to 2 seconds for peer's FIN ONLY if we haven't seen it yet
         if not peer_fin_received:
             start_time = time.time()
             while time.time() - start_time < 2.0:
@@ -533,11 +550,13 @@ class RawTCPConnection:
                         self.ack += 1
                     break
         
-        # 3. Send final ACK for the peer's FIN
-        ip_hdr_f = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=107)
-        tcp_seg_f = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
-        self.sock.sendto(ip_hdr_f + tcp_seg_f, (self.dst_ip, 0))
-        self.logger.log("SEND", parse_packet(ip_hdr_f + tcp_seg_f))
+        # Send final ACK for the peer's FIN
+        #######################################################################
+        # ip_hdr_f = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=107)
+        # tcp_seg_f = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
+        # self.sock.sendto(ip_hdr_f + tcp_seg_f, (self.dst_ip, 0))
+        # self.logger.log("SEND", parse_packet(ip_hdr_f + tcp_seg_f))
+        self._send_ack(107)
         
         self.peer_closed = True
         self.sock.close()
