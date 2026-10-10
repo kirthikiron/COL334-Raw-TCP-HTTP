@@ -259,6 +259,7 @@ class RawTCPConnection:
                     self.logger.log("RECV", parsed)
                     self.seq += 1
                     self.ack = parsed['seq'] + 1
+                    self.ack_floor = self.ack
                     syn_ack_received = True
                     if parsed.get('mss'):
                         self.mss = min(DEFAULT_MSS, parsed['mss'])
@@ -633,10 +634,12 @@ class RawTCPConnection:
                 
             # Send one ACK if we consumed data, processed a FIN, or need a Dup-ACK
             if payload or fin_processed or dup_ack_needed:
-                ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=998)
-                tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
-                self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
-                self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
+                ##############################################
+                # ip_hdr = build_ipv4_header(self.src_ip, self.dst_ip, 20, ip_id=998)
+                # tcp_seg = build_tcp_segment(self.src_ip, self.dst_ip, self.src_port, self.dst_port, self.seq, self.ack, FLAG_ACK)
+                # self.sock.sendto(ip_hdr + tcp_seg, (self.dst_ip, 0))
+                # self.logger.log("SEND", parse_packet(ip_hdr + tcp_seg))
+                self._send_ack(998)
                 
                 if payload:
                     return payload
@@ -719,6 +722,7 @@ class RawTCPListener:
                             conn.logger = self.logger
                             conn.seq = server_seq + 1
                             conn.ack = ack_parsed['seq']
+                            conn.ack_floor = conn.ack
                             
                             # Catch piggybacked data and ACK it immediately!
                             if ack_parsed['len'] > 0:
