@@ -64,7 +64,8 @@ def main():
             problems.append("missing: " + r)
 
     hdrincl = False
-    for dirpath, _, files in os.walk(os.path.join(ROOT, "src")):
+    for dirpath, dirs, files in os.walk(os.path.join(ROOT, "src")):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
         for fn in files:
             if fn.endswith(".pyc"):
                 problems.append("binary in src: " + fn)
