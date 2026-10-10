@@ -23,3 +23,13 @@ Run as root on each respective VM:
 
 ### HTTP Server (Part D)
 `sudo ./server/run-server [-p PORT] [-d DOCROOT] [--log LOGFILE]`
+
+### Kernel RST suppression & Checksum Offloading
+Because the kernel has no socket for our connections, it answers incoming
+segments with RST. Additionally, QEMU/KVM virtual NICs use checksum offloading 
+that obscures the actual checksum bytes from raw sockets, causing valid packets to be dropped.
+
+On the client and server VMs, run before using the programs:
+
+    sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
+    sudo ethtool -K <INTERFACE> rx off tx off
